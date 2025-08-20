@@ -1,28 +1,24 @@
 """
-Enumerations for SIP Client States
+SIP Client Enums - State enumerations for SIP client library
 """
 
-from enum import Enum, auto
+from enum import Enum
 
 
 class CallState(Enum):
     """Call state enumeration"""
-    
-    IDLE = auto()
-    CALLING = auto()
-    RINGING = auto()
-    CONNECTING = auto()
-    CONNECTED = auto()
-    DISCONNECTING = auto()
-    DISCONNECTED = auto()
-    FAILED = auto()
+    IDLE = "idle"
+    CALLING = "calling"
+    RINGING = "ringing"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    BUSY = "busy"
+    FAILED = "failed"
 
 
 class RegistrationState(Enum):
     """Registration state enumeration"""
-    
-    UNREGISTERED = auto()
-    REGISTERING = auto()
-    REGISTERED = auto()
-    UNREGISTERING = auto()
-    FAILED = auto() 
+    UNREGISTERED = "unregistered"
+    REGISTERING = "registering"
+    REGISTERED = "registered"
+    FAILED = "failed" 

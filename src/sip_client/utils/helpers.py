@@ -1,69 +1,84 @@
 """
-Helper Utility Functions
+Utility functions for SIP client
 """
 
 import random
-import string
-import time
-from typing import Optional
+import socket
 
 
-def generate_call_id(domain: Optional[str] = None) -> str:
+def generate_call_id(domain: str = None) -> str: # type: ignore
     """Generate a unique call ID"""
-    timestamp = str(int(time.time()))
-    random_part = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    
-    if domain:
-        return f"{timestamp}_{random_part}@{domain}"
-    else:
-        return f"{timestamp}_{random_part}"
+    if domain is None:
+        domain = socket.gethostname()
+    return f"{random.randint(100000, 999999)}@{domain}"
 
 
 def generate_tag() -> str:
-    """Generate a unique tag for SIP messages"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    """Generate a unique tag"""
+    return f"{random.randint(100000, 999999)}"
 
 
 def generate_branch() -> str:
-    """Generate a unique branch parameter"""
-    random_part = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    return f"z9hG4bK{random_part}"
+    """Generate a unique branch identifier"""
+    return f"z9hG4bK{random.randint(100000, 999999)}"
 
 
-def generate_cseq() -> int:
-    """Generate a CSeq number"""
-    return random.randint(1, 999999)
+# def get_local_ip() -> str:
+#     """Get local IP address"""
+#     return socket.gethostbyname(socket.gethostname())
 
 
-def parse_sip_uri(uri: str) -> dict:
-    """Parse a SIP URI into components"""
-    # Simple parser for sip:user@domain:port format
-    result = {
-        'scheme': 'sip',
-        'user': '',
-        'domain': '',
-        'port': None
-    }
+def get_hostname() -> str:
+    """Get local hostname"""
+    return socket.gethostname() 
+
+
+def get_local_ip() -> str:
+    """Get the primary local IPv4 address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Connect to a public IP (no packets sent, just used for routing info)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+def get_public_ip(
+    stun_host: str = "stun.l.google.com",
+    stun_port: int = 19302
+) -> str:
+    """
+    Discover the public IP address using a STUN server.
     
-    if not uri.startswith('sip:'):
-        return result
-    
-    uri_part = uri[4:]  # Remove 'sip:'
-    
-    if '@' in uri_part:
-        user_part, domain_part = uri_part.split('@', 1)
-        result['user'] = user_part
-    else:
-        domain_part = uri_part
-    
-    if ':' in domain_part:
-        domain, port = domain_part.split(':', 1)
-        result['domain'] = domain
+    Returns:
+        str: The detected public IPv4 address.
+    Raises:
+        RuntimeError: If detection fails.
+    """
+    import stun
+    nat_type, external_ip, external_port = stun.get_ip_info(stun_host=stun_host, stun_port=stun_port)
+    if not external_ip:
+        raise RuntimeError("Failed to detect public IP via STUN.")
+    return str(external_ip)
+
+def get_free_udp_port(range_min: int = 10000, range_max: int = 20000):
+    # Try a few random ports in the RTP range first, fallback to OS-chosen
+    for _ in range(6):
+        port = random.randint(range_min, range_max)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            result['port'] = int(port)
-        except ValueError:
-            pass
-    else:
-        result['domain'] = domain_part
-    
-    return result 
+            s.bind(('', port))
+            s.setblocking(False)
+            # keep socket open or return port and close? depends on architecture.
+            # If code expects an integer port, we should close and return the port.
+            # s.close()
+            return port
+        except OSError:
+            s.close()
+            continue
+    # last resort: let OS choose an ephemeral port
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port

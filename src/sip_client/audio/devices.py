@@ -1,65 +1,107 @@
 """
-Audio Device Management
+Audio Device Models - Audio device information and management
 """
 
 from dataclasses import dataclass
 from typing import List, Optional
 
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
+
 
 @dataclass
 class AudioDevice:
     """Audio device information"""
-    
-    id: int
+
+    index: int
     name: str
-    channels: int
-    sample_rate: int
-    is_input: bool = True
-    is_output: bool = True
-    is_default: bool = False
+    max_input_channels: int
+    max_output_channels: int
+    default_sample_rate: float
+    
+    @property
+    def is_input(self) -> bool:
+        """Check if device can be used for input"""
+        return self.max_input_channels > 0
+    
+    @property
+    def is_output(self) -> bool:
+        """Check if device can be used for output"""
+        return self.max_output_channels > 0
     
     def __str__(self) -> str:
-        """String representation of the device"""
-        direction = []
+        device_type = []
         if self.is_input:
-            direction.append("Input")
+            device_type.append("INPUT")
         if self.is_output:
-            direction.append("Output")
-        
-        default_str = " (Default)" if self.is_default else ""
-        return f"Device {self.id}: {self.name} [{'/'.join(direction)}]{default_str}"
+            device_type.append("OUTPUT")
+        return f"{self.index}: {self.name} ({'/'.join(device_type)})"
 
 
-def get_audio_devices() -> List[AudioDevice]:
-    """Get list of available audio devices"""
-    # Placeholder implementation - returns a mock device
-    # In a real implementation, this would enumerate actual audio devices
-    return [
-        AudioDevice(
-            id=0,
-            name="Default Audio Device",
-            channels=2,
-            sample_rate=44100,
-            is_input=True,
-            is_output=True,
-            is_default=True
-        )
-    ]
-
-
-def get_default_input_device() -> Optional[AudioDevice]:
-    """Get the default input device"""
-    devices = get_audio_devices()
-    for device in devices:
-        if device.is_input and device.is_default:
-            return device
-    return devices[0] if devices else None
-
-
-def get_default_output_device() -> Optional[AudioDevice]:
-    """Get the default output device"""
-    devices = get_audio_devices()
-    for device in devices:
-        if device.is_output and device.is_default:
-            return device
-    return devices[0] if devices else None 
+class AudioDeviceManager:
+    """Audio device enumeration and management"""
+    
+    def __init__(self):
+        if not pyaudio:
+            raise ImportError("pyaudio is required for audio functionality")
+        self.audio = pyaudio.PyAudio()
+    
+    def get_devices(self) -> List[AudioDevice]:
+        """Get list of available audio devices"""
+        devices = []
+        for i in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(i)
+            devices.append(AudioDevice(
+                index = i,
+                name = str(info['name']),
+                max_input_channels = int(info['maxInputChannels']),
+                max_output_channels = int(info['maxOutputChannels']),
+                default_sample_rate = float(info['defaultSampleRate'])
+            ))
+        return devices
+    
+    def get_default_input_device(self) -> Optional[AudioDevice]:
+        """Get default input device"""
+        try:
+            info = self.audio.get_default_input_device_info()
+            return AudioDevice(
+                index = int(info['index']),
+                name = str(info['name']),
+                max_input_channels = int(info['maxInputChannels']),
+                max_output_channels = int(info['maxOutputChannels']),
+                default_sample_rate = float(info['defaultSampleRate'])
+            )
+        except Exception:
+            return None
+    
+    def get_default_output_device(self) -> Optional[AudioDevice]:
+        """Get default output device"""
+        try:
+            info = self.audio.get_default_output_device_info()
+            return AudioDevice(
+                index = int(info['index']),
+                name = str(info['name']),
+                max_input_channels = int(info['maxInputChannels']),
+                max_output_channels = int(info['maxOutputChannels']),
+                default_sample_rate = float(info['defaultSampleRate'])
+            )
+        except Exception:
+            return None
+    
+    def validate_device(self, device_index: int, for_input: bool = True) -> bool:
+        """Validate if device can be used for input or output"""
+        try:
+            info = self.audio.get_device_info_by_index(device_index)
+            if for_input:
+                return int(info['maxInputChannels']) > 0
+            else:
+                return int(info['maxOutputChannels']) > 0
+        except Exception:
+            return False
+    
+    def cleanup(self):
+        """Clean up audio resources"""
+        if self.audio:
+            self.audio.terminate() 

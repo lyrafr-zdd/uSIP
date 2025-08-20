@@ -1,38 +1,34 @@
 """
-Simplified SIP Client using existing simple_sip_client.py functionality
+Main SIP Client - Orchestrates all components to provide a clean API
 """
 
 import os
-import sys
-import importlib.util
+import time
+import threading
 import logging
-from typing import Optional
-
-# Import the original SimpleSIPClient
-# This is a bridge to use the working simple_sip_client.py
-spec = importlib.util.spec_from_file_location("simple_sip_client", 
-                                              os.path.join(os.path.dirname(__file__), "../../simple_sip_client.py"))
-if spec and spec.loader:
-    simple_sip_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(simple_sip_module)
-    SimpleSIPClient = simple_sip_module.SimpleSIPClient
-else:
-    raise ImportError("Could not load simple_sip_client.py")
+from typing import Optional, Dict, List, Callable
 
 from .models.account import SIPAccount
 from .models.call import CallInfo
 from .models.enums import CallState, RegistrationState
 from .audio.manager import AudioManager
 from .audio.devices import AudioDevice
+from .sip.protocol import SIPProtocol
+from .sip.messages import SIPMessageParser
+from .utils.helpers import generate_call_id, generate_tag, get_local_ip, get_public_ip, get_free_udp_port
 
 logger = logging.getLogger(__name__)
 
 
 class SIPClient:
-    """Main SIP client - bridges to the working simple_sip_client.py"""
+    """Main SIP client with voice support"""
     
     def __init__(self, account: Optional[SIPAccount] = None):
-        """Initialize SIP client"""
+        """Initialize SIP client
+        
+        Args:
+            account: SIP account configuration. If None, will try to load from environment.
+        """
         if account is None:
             account = SIPAccount(
                 username=os.getenv('SIP_USERNAME', ''),
@@ -42,49 +38,105 @@ class SIPClient:
             )
         
         self.account = account
-        self._simple_client = SimpleSIPClient()
+        self.sip_protocol = SIPProtocol(account)
         self.audio_manager = AudioManager()
         
         # State
         self.registration_state = RegistrationState.UNREGISTERED
-        self.calls = {}
+        self.calls: Dict[str, CallInfo] = {}
+        # self.rtp_port = 10000
+        self.rtp_port = get_free_udp_port()
         
-        logger.info("SIP client initialized")
+        # Keep-alive timer
+        self.keepalive_timer = None
+        self.keepalive_interval = 300  # seconds
+        
+        # Callbacks
+        self.on_registration_state: Optional[Callable[[RegistrationState], None]] = None
+        self.on_incoming_call: Optional[Callable[[CallInfo], None]] = None
+        self.on_call_state: Optional[Callable[[CallInfo], None]] = None
+        self.on_call_media: Optional[Callable[[CallInfo], None]] = None
+        self.on_message: Optional[Callable[[str, str], None]] = None
+        
+        # Set up SIP protocol callbacks
+        self._setup_sip_callbacks()
+    
+    def _setup_sip_callbacks(self):
+        """Set up SIP protocol callbacks"""
+        self.sip_protocol.on_response_received = self._handle_sip_response
+        self.sip_protocol.on_request_received = self._handle_sip_request
+        self.sip_protocol.on_message_received = self._handle_sip_message
     
     def start(self) -> bool:
         """Start the SIP client"""
-        logger.info("SIP client started")
-        return True
+        try:
+            if not self.sip_protocol.start():
+                return False
+            
+            logger.info("SIP client started")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start SIP client: {e}")
+            return False
     
     def stop(self):
         """Stop the SIP client"""
-        self._simple_client.cleanup()
+        # End all active calls
+        for call_id in list(self.calls.keys()):
+            self.hangup(call_id)
+        
+        # Unregister
+        if self.registration_state == RegistrationState.REGISTERED:
+            self.unregister()
+        
+        # Stop keep-alive timer
+        if self.keepalive_timer:
+            self.keepalive_timer.cancel()
+        
+        # Stop components
+        self.sip_protocol.stop()
         self.audio_manager.cleanup()
+        
         logger.info("SIP client stopped")
     
     def register(self) -> bool:
         """Register with SIP server"""
+        if self.registration_state == RegistrationState.REGISTERING:
+            return False
+        
         try:
-            success = self._simple_client.send_register()
+            self._set_registration_state(RegistrationState.REGISTERING)
+            
+            # Send REGISTER request
+            success = self.sip_protocol.send_register()
+            
             if success:
-                self.registration_state = RegistrationState.REGISTERED
-                logger.info("Registration successful")
+                logger.info("REGISTER sent, waiting for response")
+                return True
             else:
-                self.registration_state = RegistrationState.FAILED
-                logger.error("Registration failed")
-            return success
+                self._set_registration_state(RegistrationState.FAILED)
+                return False
+                
         except Exception as e:
             logger.error(f"Registration error: {e}")
-            self.registration_state = RegistrationState.FAILED
+            self._set_registration_state(RegistrationState.FAILED)
             return False
     
     def unregister(self) -> bool:
         """Unregister from SIP server"""
         try:
-            # Simple client doesn't have explicit unregister, just cleanup
-            self.registration_state = RegistrationState.UNREGISTERED
-            logger.info("Unregistered")
-            return True
+            if self.keepalive_timer:
+                self.keepalive_timer.cancel()
+            
+            # Send REGISTER with Expires: 0
+            success = self.sip_protocol.send_register(expires=0)
+            
+            if success:
+                self._set_registration_state(RegistrationState.UNREGISTERED)
+            
+            return success
+            
         except Exception as e:
             logger.error(f"Unregistration error: {e}")
             return False
@@ -92,51 +144,360 @@ class SIPClient:
     def make_call(self, target_uri: str, input_device: Optional[int] = None, 
                   output_device: Optional[int] = None) -> Optional[str]:
         """Make an outgoing call"""
+        if self.registration_state != RegistrationState.REGISTERED:
+            logger.error("Not registered")
+            return None
+        
         try:
-            # Extract number from URI if needed
-            if target_uri.startswith('sip:'):
-                # Extract the user part from sip:user@domain
-                number = target_uri.split(':')[1].split('@')[0]
-            else:
-                number = target_uri
+            # Normalize target URI
+            if not target_uri.startswith('sip:'):
+                if not target_uri.startswith('+'):
+                    target_uri = f"+1{target_uri}"  # Assuming US numbers
+                target_uri = f"sip:{target_uri}@{self.account.domain}"
             
-            success = self._simple_client.make_call(number)
-            if success:
-                call_id = f"call_{number}"
-                self.calls[call_id] = {
-                    'target': target_uri,
-                    'state': CallState.CONNECTED,
-                    'call_id': call_id
-                }
-                logger.info(f"Call to {target_uri} initiated")
+            # Get audio devices
+            if input_device is None:
+                device = self.audio_manager.get_default_input_device()
+                input_device = device.index if device else 0
+            
+            if output_device is None:
+                device = self.audio_manager.get_default_output_device()
+                output_device = device.index if device else 0
+            
+            # Send INVITE
+            call_id = self.sip_protocol.send_invite(target_uri, self.rtp_port)
+            logger.info(f"Sending invite to {target_uri} through {self.rtp_port}")
+            
+            if call_id:
+                # Create call info
+                call_info = CallInfo(
+                    call_id=call_id,
+                    local_uri=self.account.uri,
+                    remote_uri=target_uri,
+                    state=CallState.CALLING,
+                    direction="outgoing",
+                    start_time=time.time(),
+                    local_tag=generate_tag(),
+                    input_device=input_device,
+                    output_device=output_device
+                )
+                
+                self.calls[call_id] = call_info
+                self._set_call_state(call_info, CallState.CALLING)
+                
+                logger.info(f"Call initiated: {call_id}")
                 return call_id
-            else:
-                logger.error(f"Call to {target_uri} failed")
-                return None
+            
+            return None
+            
         except Exception as e:
-            logger.error(f"Make call error: {e}")
+            logger.error(f"Call error: {e}")
             return None
     
-    def hangup(self, call_id: Optional[str] = None) -> bool:
-        """Hang up a call"""
+    def answer_call(self, call_info: CallInfo, input_device: Optional[int] = None, 
+                   output_device: Optional[int] = None) -> bool:
+        """Answer an incoming call"""
+        call_id = call_info.call_id
+        if call_id not in self.calls:
+            return False
+        
+        call_info = self.calls[call_id]
+        if call_info.state != CallState.RINGING:
+            return False
+        
         try:
-            self._simple_client.hangup()
-            if call_id and call_id in self.calls:
-                del self.calls[call_id]
-            logger.info("Call ended")
+            # Get audio devices
+            if input_device is None:
+                device = self.audio_manager.get_default_input_device()
+                input_device = device.index if device else 0
+            
+            if output_device is None:
+                device = self.audio_manager.get_default_output_device()
+                output_device = device.index if device else 0
+            
+            call_info.input_device = input_device
+            call_info.output_device = output_device
+            
+            call_info.answer_time = time.time()
+            # Deprecated in favor of confirm_call()
+            # self._set_call_state(call_info, CallState.CONNECTED)
+
+            self._confirm_call(call_info)
+            
+            # Start audio
+            self.audio_manager.start_audio_stream(input_device, output_device, self.rtp_port)
+            
+            # print("[uSIP.Client.answer_call] Call answered!")
+            logger.info(f"Call {call_id} answered")
             return True
+            
+        except Exception as e:
+            logger.error(f"Error answering call: {e}")
+            return False
+    
+    def hangup(self, call_id: str) -> bool:
+        """Hang up a call"""
+        if call_id not in self.calls:
+            return False
+        
+        call_info = self.calls[call_id]
+        
+        try:
+            # Send BYE if call is connected
+            if call_info.state == CallState.CONNECTED:
+                self.sip_protocol.send_bye(call_info)
+            
+            # Stop audio
+            self.audio_manager.stop_audio_stream()
+            
+            call_info.end_time = time.time()
+            self._set_call_state(call_info, CallState.DISCONNECTED)
+            
+            # Clean up call
+            del self.calls[call_id]
+            
+            logger.info(f"Call {call_id} ended")
+            return True
+            
         except Exception as e:
             logger.error(f"Hangup error: {e}")
             return False
     
-    def get_calls(self):
+    def get_calls(self) -> List[CallInfo]:
         """Get list of active calls"""
         return list(self.calls.values())
     
-    def get_audio_devices(self):
+    def get_call(self, call_id: str) -> Optional[CallInfo]:
+        """Get call information"""
+        return self.calls.get(call_id)
+    
+    def get_audio_devices(self) -> List[AudioDevice]:
         """Get list of available audio devices"""
         return self.audio_manager.get_audio_devices()
     
-    def cleanup(self):
-        """Clean up resources"""
-        self.stop() 
+    def switch_audio_device(self, call_id: str, input_device: Optional[int] = None, 
+                           output_device: Optional[int] = None) -> bool:
+        """Switch audio devices during active call"""
+        if call_id not in self.calls:
+            return False
+        
+        call_info = self.calls[call_id]
+        if call_info.state != CallState.CONNECTED:
+            return False
+        
+        success = True
+        
+        if input_device is not None:
+            success &= self.audio_manager.switch_input_device(input_device)
+            if success:
+                call_info.input_device = input_device
+        
+        if output_device is not None:
+            success &= self.audio_manager.switch_output_device(output_device)
+            if success:
+                call_info.output_device = output_device
+        
+        return success
+    
+    def _handle_sip_response(self, message: str, response_code: int):
+        """Handle SIP response"""
+        logger.debug(f"SIP response {response_code}: {message}")
+        # print(f"[SIPClient._handle_sip_response: Response is code {response_code}, message {message}]")
+        
+        # Handle registration responses
+        if "REGISTER" in message:
+            if response_code == 200:
+                self._set_registration_state(RegistrationState.REGISTERED)
+                self._start_keepalive()
+            elif response_code in [401, 407]:
+                # Handle authentication challenge
+                success = self.sip_protocol.handle_auth_challenge(message, "REGISTER", f"sip:{self.account.domain}")
+                if not success:
+                    self._set_registration_state(RegistrationState.FAILED)
+            else:
+                self._set_registration_state(RegistrationState.FAILED)
+        
+        # Handle INVITE responses
+        elif "INVITE" in message:
+            call_id = SIPMessageParser.extract_call_id(message)
+            if call_id and call_id in self.calls:
+                call_info = self.calls[call_id]
+                
+                if response_code == 200:
+                    # Call answered
+                    sip_info = self.sip_protocol.extract_sip_info(message)
+                    call_info.remote_tag = sip_info.get('to_tag')
+                    call_info.contact_uri = sip_info.get('contact_uri')
+                    
+                    # Send ACK
+                    self.sip_protocol.send_ack(call_info)
+                    
+                    # Start audio
+                    if call_info.input_device is not None and call_info.output_device is not None:
+                        self.audio_manager.start_audio_stream(
+                            call_info.input_device, 
+                            call_info.output_device, 
+                            self.rtp_port
+                        )
+                    
+                    call_info.answer_time = time.time()
+                    self._set_call_state(call_info, CallState.CONNECTED)
+                    
+                elif response_code == 180:
+                    self._set_call_state(call_info, CallState.RINGING)
+                elif response_code == 183:
+                    # Session progress
+                    pass
+                elif response_code == 486:
+                    self._set_call_state(call_info, CallState.BUSY)
+                    del self.calls[call_id]
+                elif response_code in [401, 407]:
+                    # Handle authentication challenge
+                    success = self.sip_protocol.handle_auth_challenge(message, "INVITE", call_info.remote_uri)
+                    if not success:
+                        self._set_call_state(call_info, CallState.FAILED)
+                        del self.calls[call_id]
+                else:
+                    self._set_call_state(call_info, CallState.FAILED)
+                    del self.calls[call_id]
+    
+    def _handle_sip_request(self, message: str, method: str):
+        """Handle SIP request"""
+        logger.debug(f"SIP request {method}: {message}")
+        
+        if method == "INVITE":
+            self._handle_incoming_invite(message)
+        elif method == "BYE":
+            self._handle_incoming_bye(message)
+        elif method == "ACK":
+            # ACK received, call is fully established
+            pass
+        elif method == "OPTIONS":
+            print("SIPClient._handle_sip_request: Got pinged. We're here!")
+    
+    def _handle_incoming_invite(self, message: str):
+        """Handle incoming INVITE request"""
+        # print(f"[SIPClient._handle_incoming_invite: About to extract info.]")
+        sip_info = self.sip_protocol.extract_sip_info(message)
+        call_id = sip_info.get('call_id')
+        
+        if call_id:
+            # Create call info
+            call_info = CallInfo(
+                call_id=call_id,
+                # local_uri=self.account.uri,
+                local_uri = get_local_ip(),
+                remote_uri=sip_info.get('from_uri', ''),
+                state=CallState.RINGING,
+                direction="incoming",
+                start_time=time.time(),
+                local_tag=generate_tag(),
+                remote_tag=sip_info.get('from_tag'),
+                # WARN Sledgehammer approach. AI-assisted.
+                original_invite=sip_info.get('original_invite')
+            )
+            
+            self.calls[call_id] = call_info
+            
+            # Send 100 Trying
+            self.sip_protocol.send_response(100, "Trying", message)
+            
+            # Send 180 Ringing
+            self.sip_protocol.send_response(180, "Ringing", message)
+            
+            self._set_call_state(call_info, CallState.RINGING)
+            
+            # Notify callback
+            if self.on_incoming_call:
+                self.on_incoming_call(call_info)
+    
+    def _handle_incoming_bye(self, message: str):
+        """Handle incoming BYE request"""
+        call_id = SIPMessageParser.extract_call_id(message)
+        
+        if call_id and call_id in self.calls:
+            call_info = self.calls[call_id]
+            
+            # Send 200 OK
+            self.sip_protocol.send_response(200, "OK", message)
+            
+            # Stop audio
+            self.audio_manager.stop_audio_stream()
+            
+            call_info.end_time = time.time()
+            self._set_call_state(call_info, CallState.DISCONNECTED)
+            
+            # Clean up
+            del self.calls[call_id]
+    
+    def _handle_sip_message(self, message: str, addr):
+        """Handle any SIP message"""
+        if self.on_message:
+            self.on_message(message, str(addr))
+    
+    def _set_registration_state(self, state: RegistrationState):
+        """Set registration state and notify callback"""
+        self.registration_state = state
+        logger.info(f"Registration state: {state.value}")
+        if self.on_registration_state:
+            self.on_registration_state(state)
+    
+    def _set_call_state(self, call_info: CallInfo, state: CallState):
+        """Set call state and notify callback"""
+        call_info.state = state
+        logger.info(f"Call {call_info.call_id} state: {state.value}")
+        if self.on_call_state:
+            self.on_call_state(call_info)
+    
+    def _start_keepalive(self):
+        """Start registration keepalive timer"""
+        def keepalive():
+            if self.registration_state == RegistrationState.REGISTERED:
+                self.register()  # Re-register
+                self.keepalive_timer = threading.Timer(self.keepalive_interval, keepalive)
+                self.keepalive_timer.start()
+        
+        self.keepalive_timer = threading.Timer(self.keepalive_interval, keepalive)
+        self.keepalive_timer.start() 
+
+    def _confirm_call(self, call_info: CallInfo):
+        """Send a proper 200 OK in response to stored INVITE"""
+        if not call_info.original_invite:
+            raise ValueError("No original INVITE stored for this call.")
+
+        sdp_body = self._generate_sdp(call_info)  # WARN Auto-generated. There be dragons.
+        self.sip_protocol.send_response(
+            response_code=200,
+            response_text="OK",
+            request_message=call_info.original_invite,
+            additional_headers={
+                "Contact": f"<{self.account.uri}>"
+            },
+            body=sdp_body,
+            content_type="application/sdp"
+        )
+        self._set_call_state(call_info, CallState.CONNECTED)
+
+    def _generate_sdp(self, call_info: CallInfo) -> str:
+        # my_ip = call_info.local_uri
+        my_ip = get_public_ip()
+        self.rtp_port = get_free_udp_port()
+        rtp_port = self.rtp_port
+
+        return (
+            "v=0\r\n"
+            f"o=user 18555 18555 IN IP4 {my_ip}\r\n"
+            "s=user\r\n"
+            f"c=IN IP4 {my_ip}\r\n"
+            "t=0 0\r\n"
+            # f"m=audio {rtp_port} RTP/AVP 0 8 96\r\n"
+            f"m=audio {rtp_port} RTP/AVP 8 101\r\n"
+            # WARN Hardcoded PCMA only!
+            # "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=ptime:20\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=fmtp:101 0-15\r\n"
+            # "a=rtpmap:96 opus/48000/2\r\n"
+            "a=sendrecv\r\n"
+        )

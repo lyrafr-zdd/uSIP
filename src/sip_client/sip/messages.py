@@ -1,101 +1,240 @@
 """
-SIP Message Parser
+SIP Message Building and Parsing
 """
 
-import logging
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Dict, Optional, Tuple
+from ..utils.helpers import get_hostname, get_local_ip
 
-logger = logging.getLogger(__name__)
 
-
-class SIPMessage:
-    """Represents a SIP message"""
+class SIPMessageBuilder:
+    """Builder for SIP messages"""
     
-    def __init__(self, raw_message: str):
-        self.raw = raw_message
-        self.headers: Dict[str, str] = {}
-        self.body = ""
-        self.method = ""
-        self.uri = ""
-        self.version = ""
-        self.status_code = 0
-        self.reason_phrase = ""
+    @staticmethod
+    def create_message(method: str, uri: str, headers: Dict[str, str], body: str = "") -> str:
+        """Create a SIP message"""
+        message = f"{method} {uri} SIP/2.0\r\n"
         
-        self._parse()
-    
-    def _parse(self):
-        """Parse the raw SIP message"""
-        lines = self.raw.split('\n')
-        if not lines:
-            return
+        for header, value in headers.items():
+            message += f"{header}: {value}\r\n"
         
-        # Parse first line (request line or status line)
-        first_line = lines[0].strip()
-        if first_line.startswith('SIP/2.0'):
-            # Response
-            parts = first_line.split(' ', 2)
-            if len(parts) >= 2:
-                self.version = parts[0]
-                try:
-                    self.status_code = int(parts[1])
-                except ValueError:
-                    pass
-                if len(parts) >= 3:
-                    self.reason_phrase = parts[2]
-        else:
-            # Request
-            parts = first_line.split(' ')
-            if len(parts) >= 3:
-                self.method = parts[0]
-                self.uri = parts[1]
-                self.version = parts[2]
+        message += f"Content-Length: {len(body)}\r\n"
+        message += "\r\n"
+        message += body
         
-        # Parse headers
-        header_end = 1
-        for i, line in enumerate(lines[1:], 1):
-            line = line.strip()
-            if not line:
-                header_end = i + 1
-                break
-            
-            if ':' in line:
-                key, value = line.split(':', 1)
-                self.headers[key.strip()] = value.strip()
-        
-        # Parse body
-        if header_end < len(lines):
-            self.body = '\n'.join(lines[header_end:])
+        return message
     
-    @property
-    def is_request(self) -> bool:
-        """Check if this is a request message"""
-        return bool(self.method)
+    @staticmethod
+    def create_register_headers(username: str, domain: str, port: int, 
+                               local_tag: str, branch: str, call_id: str, 
+                               cseq: int, expires: int = 3600) -> Dict[str, str]:
+        """Create headers for REGISTER request"""
+        return {
+            'Via': f"SIP/2.0/UDP {get_hostname()}:{port};branch={branch}",
+            'From': f"<sip:{username}@{domain}>;tag={local_tag}",
+            'To': f"<sip:{username}@{domain}>",
+            'Call-ID': call_id,
+            'CSeq': f"{cseq} REGISTER",
+            'Contact': f"<sip:{username}@{get_hostname()}:{port}>",
+            'Max-Forwards': '70',
+            'User-Agent': 'Python SIP Client Library 1.0',
+            'Expires': str(expires)
+        }
     
-    @property
-    def is_response(self) -> bool:
-        """Check if this is a response message"""
-        return self.status_code > 0
+    @staticmethod
+    def create_invite_headers(username: str, domain: str, port: int, target_uri: str,
+                             local_tag: str, branch: str, call_id: str, 
+                             cseq: int) -> Dict[str, str]:
+        """Create headers for INVITE request"""
+        return {
+            'Via': f"SIP/2.0/UDP {get_hostname()}:{port};branch={branch}",
+            'From': f"<sip:{username}@{domain}>;tag={local_tag}",
+            'To': f"<{target_uri}>",
+            'Call-ID': call_id,
+            'CSeq': f"{cseq} INVITE",
+            'Contact': f"<sip:{username}@{get_hostname()}:{port}>",
+            'Max-Forwards': '70',
+            'User-Agent': 'Python SIP Client Library 1.0',
+            'Content-Type': 'application/sdp'
+        }
     
-    def get_header(self, name: str) -> Optional[str]:
-        """Get a header value by name (case-insensitive)"""
-        for key, value in self.headers.items():
-            if key.lower() == name.lower():
-                return value
-        return None
+    @staticmethod
+    def create_ack_headers(username: str, domain: str, port: int,
+                          local_tag: str, remote_tag: str, branch: str, 
+                          call_id: str, cseq: int) -> Dict[str, str]:
+        """Create headers for ACK request"""
+        return {
+            'Via': f"SIP/2.0/UDP {get_hostname()}:{port};branch={branch}",
+            'From': f"<sip:{username}@{domain}>;tag={local_tag}",
+            'To': f"<sip:{username}@{domain}>;tag={remote_tag}",
+            'Call-ID': call_id,
+            'CSeq': f"{cseq} ACK",
+            'Max-Forwards': '70',
+            'User-Agent': 'Python SIP Client Library 1.0'
+        }
+    
+    @staticmethod
+    def create_bye_headers(username: str, domain: str, port: int,
+                          local_tag: str, remote_tag: str, branch: str, 
+                          call_id: str, cseq: int) -> Dict[str, str]:
+        """Create headers for BYE request"""
+        return {
+            'Via': f"SIP/2.0/UDP {get_hostname()}:{port};branch={branch}",
+            'From': f"<sip:{username}@{domain}>;tag={local_tag}",
+            'To': f"<sip:{username}@{domain}>;tag={remote_tag}",
+            'Call-ID': call_id,
+            'CSeq': f"{cseq} BYE",
+            'Max-Forwards': '70',
+            'User-Agent': 'Python SIP Client Library 1.0'
+        }
+    
+    @staticmethod
+    def create_sdp_body(username: str, rtp_port: int) -> str:
+        """Create SDP body for audio call"""
+        local_ip = get_local_ip()
+        return f"""v=0
+o={username} 123456 123456 IN IP4 {local_ip}
+s=Python SIP Client Library
+c=IN IP4 {local_ip}
+t=0 0
+m=audio {rtp_port} RTP/AVP 0 8 18 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:18 G729/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=sendrecv
+"""
 
 
 class SIPMessageParser:
-    """Parses SIP messages"""
+    """Parser for SIP messages"""
     
-    def __init__(self):
-        """Initialize message parser"""
-        pass
+    @staticmethod
+    def parse_headers(message: str) -> Dict[str, str]:
+        """Parse SIP headers from message"""
+        headers = {}
+        lines = message.split('\r\n')
+        
+        for line in lines[1:]:  # Skip first line (request/response line)
+            if not line.strip():
+                break
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if key in headers:
+                    # Concatenate multiple same-name headers with CRLF
+                    headers[key] += f"\r\n{key}: {value}"
+                else:
+                    headers[key] = value
+        
+        return headers
     
-    def parse(self, raw_message: str) -> SIPMessage:
-        """Parse a raw SIP message"""
-        return SIPMessage(raw_message)
+    @staticmethod
+    def extract_tag(header: str) -> Optional[str]:
+        """Extract tag from From or To header"""
+        if 'tag=' in header:
+            return header.split('tag=')[1].split(';')[0].strip()
+        return None
     
-    def is_complete_message(self, data: str) -> bool:
-        """Check if the data contains a complete SIP message"""
-        # Simple check for double CRLF indicating end of headers
-        return '\r\n\r\n' in data or '\n\n' in data 
+    @staticmethod
+    def extract_contact_uri(header: str) -> Optional[str]:
+        """Extract contact URI from Contact header"""
+        if '<' in header and '>' in header:
+            return header.split('<')[1].split('>')[0].strip()
+        else:
+            # Simple format without < >
+            return header.split('Contact:')[1].strip().split(';')[0].strip()
+    
+    @staticmethod
+    def extract_call_id(message: str) -> Optional[str]:
+        """Extract Call-ID from SIP message"""
+        headers = SIPMessageParser.parse_headers(message)
+        return headers.get('Call-ID')
+    
+    @staticmethod
+    def extract_cseq(message: str) -> Optional[Tuple[int, str]]:
+        """Extract CSeq number and method from SIP message"""
+        headers = SIPMessageParser.parse_headers(message)
+        cseq_header = headers.get('CSeq')
+        if cseq_header:
+            parts = cseq_header.split(' ', 1)
+            if len(parts) == 2:
+                try:
+                    return int(parts[0]), parts[1]
+                except ValueError:
+                    pass
+        return None
+    
+    @staticmethod
+    def extract_from_uri(message: str) -> Optional[str]:
+        """Extract URI from From header"""
+        headers = SIPMessageParser.parse_headers(message)
+        from_header = headers.get('From')
+        if from_header:
+            if '<' in from_header and '>' in from_header:
+                return from_header.split('<')[1].split('>')[0]
+            else:
+                return from_header.split(':')[1].split(';')[0]
+        return None
+    
+    @staticmethod
+    def extract_to_uri(message: str) -> Optional[str]:
+        """Extract URI from To header"""
+        headers = SIPMessageParser.parse_headers(message)
+        to_header = headers.get('To')
+        if to_header:
+            if '<' in to_header and '>' in to_header:
+                return to_header.split('<')[1].split('>')[0]
+            else:
+                return to_header.split(':')[1].split(';')[0]
+        return None
+    
+    @staticmethod
+    def get_response_code(message: str) -> Optional[int]:
+        """Extract response code from SIP response"""
+        lines = message.split('\r\n')
+        if lines:
+            first_line = lines[0]
+            if first_line.startswith('SIP/2.0'):
+                parts = first_line.split(' ')
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+        return None
+    
+    @staticmethod
+    def get_method(message: str) -> Optional[str]:
+        """Extract method from SIP request"""
+        lines = message.split('\r\n')
+        if lines:
+            first_line = lines[0]
+            if not first_line.startswith('SIP/2.0'):
+                parts = first_line.split(' ')
+                if len(parts) >= 1:
+                    return parts[0]
+        return None
+    
+    @staticmethod
+    def extract_sdp_body(message: str) -> Optional[str]:
+        """Extract SDP body from SIP message"""
+        if '\r\n\r\n' in message:
+            return message.split('\r\n\r\n')[1]
+        return None
+    
+    @staticmethod
+    def parse_sdp_rtp_port(sdp_body: str) -> Optional[int]:
+        """Parse RTP port from SDP body"""
+        for line in sdp_body.split('\n'):
+            if line.startswith('m=audio'):
+                parts = line.split(' ')
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+        return None 
